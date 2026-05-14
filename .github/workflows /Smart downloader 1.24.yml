@@ -1,0 +1,130 @@
+name: Smart downloader 1.24
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Enter "URL" "v/a" "video resolution/audio bitrate" "video FPS (optional)"'
+        required: true
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Parse input (Is it YouTube?)
+        id: parse
+        run: |
+          INPUT="${{ github.event.inputs.url }}"
+          IFS=' ' read -ra TOKENS <<< "$INPUT"
+          current_url=""
+          current_opts=()
+          > tasks.txt
+          for token in "${TOKENS[@]}"; do
+            if [[ "$token" =~ ^https?:// ]]; then
+              if [ -n "$current_url" ]; then
+                echo "$current_url ${current_opts[*]}" >> tasks.txt
+              fi
+              current_url="$token"
+              current_opts=()
+            else
+              current_opts+=("$token")
+            fi
+          done
+          if [ -n "$current_url" ]; then
+            echo "$current_url ${current_opts[*]}" >> tasks.txt
+          fi
+          if grep -Eq '(youtube\.com/watch\?v=|youtu\.be/)' tasks.txt; then
+            echo "IS_YOUTUBE=true" >> $GITHUB_OUTPUT
+          else
+            echo "IS_YOUTUBE=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Write Cookies from Secrets
+        if: steps.parse.outputs.IS_YOUTUBE == 'true'
+        run: |
+          echo "${{ secrets.COOKIES }}" > cookies.txt
+          echo "Cookies file ready."
+
+      - name: Install tools (YouTube only)
+        if: steps.parse.outputs.IS_YOUTUBE == 'true'
+        run: |
+          if ! command -v yt-dlp &> /dev/null; then
+            sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+            sudo chmod a+rx /usr/local/bin/yt-dlp
+          fi
+          if ! command -v deno &> /dev/null; then
+            curl -fsSL https://deno.land/install.sh | sh -s -- -y
+            echo "$HOME/.deno/bin" >> $GITHUB_PATH
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Select format (YouTube only)
+        if: steps.parse.outputs.IS_YOUTUBE == 'true'
+        run: python3 Logic.py --select
+
+      - name: Download
+        run: python3 Logic.py --download
+
+      - name: Remux (YouTube video only)
+        run: python3 Logic.py --remux
+
+      - name: Create ZIP & Split file
+        run: python3 Logic.py --zip
+
+      - name: Upload to download folder
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          rm -f download_queue.json selected_formats.json tasks.txt temp_*.json
+          mkdir -p downloads
+          if [ -d final_downloads ] && [ "$(ls -A final_downloads 2>/dev/null)" ]; then
+            mv final_downloads/* downloads/
+          fi
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git config http.postBuffer 2147483648
+
+          if [ ! -d downloads ] || [ -z "$(ls -A downloads 2>/dev/null)" ]; then
+            echo "No files to upload."
+            exit 0
+          fi
+
+          FILES=(downloads/*)
+          total=${#FILES[@]}
+          BATCH=1
+          start=0
+
+          while [ $start -lt $total ]; do
+            end=$(( start + BATCH ))
+            [ $end -gt $total ] && end=$total
+
+            git add "${FILES[@]:start:end-start}"
+            if git diff --cached --quiet; then
+              echo "No changes to commit for parts $(($start+1))-$end"
+            else
+              git pull --rebase --autostash origin "$BRANCH"
+              git commit -m "Add parts $(($start+1))-$end [skip ci]"
+              pushed=false
+              for attempt in $(seq 1 20); do
+                if git push origin "$BRANCH"; then
+                  echo "Successfully pushed parts $(($start+1))-$end"
+                  pushed=true
+                  break
+                else
+                  echo "Push attempt $attempt/20 failed, retrying..."
+                  git pull --rebase --autostash origin "$BRANCH"
+                  sleep 2
+                fi
+              done
+              if [ "$pushed" = false ]; then
+                echo "ERROR: Failed to push parts $(($start+1))-$end after 20 attempts."
+              fi
+              rm -f "${FILES[@]:start:end-start}"
+            fi
+            start=$end
+          done
+
+          echo "All files uploaded to the 'downloads' folder."
