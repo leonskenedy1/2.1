@@ -1,0 +1,228 @@
+name: Direct link & Youtube downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Enter "URL" "v/a" "video resolution/audio bitrate" "video FPS (optional)"'
+        required: true
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Parse input (Is it YouTube?)
+        id: detect
+        run: |
+          INPUT="${{ github.event.inputs.url }}"
+          LINK=$(echo "$INPUT" | awk '{print $1}')
+          is_youtube() {
+            echo "$1" | grep -Eq '(youtube\.com/watch\?v=|youtu\.be/)'
+          }
+          if is_youtube "$LINK"; then
+            echo "IS_YOUTUBE=true" >> $GITHUB_OUTPUT
+          else
+            echo "IS_YOUTUBE=false" >> $GITHUB_OUTPUT
+          fi
+          echo "LINK=$LINK" >> $GITHUB_OUTPUT
+
+      - name: Install tools (YouTube only)
+        if: steps.detect.outputs.IS_YOUTUBE == 'true'
+        run: |
+          if ! command -v yt-dlp &> /dev/null; then
+            sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+            sudo chmod a+rx /usr/local/bin/yt-dlp
+          fi
+          if ! command -v jq &> /dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq jq
+          fi
+          if ! command -v deno &> /dev/null; then
+            curl -fsSL https://deno.land/install.sh | sh -s -- -y
+            echo "$HOME/.deno/bin" >> $GITHUB_PATH
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Select format (YouTube only)
+        if: steps.detect.outputs.IS_YOUTUBE == 'true'
+        id: select_format
+        run: |
+          INPUT="${{ github.event.inputs.url }}"
+          read -r _ type val1 val2 <<< "$INPUT"
+          LINK="${{ steps.detect.outputs.LINK }}"
+          if [[ "$type" != "v" && "$type" != "a" ]]; then
+            type="v"
+            val1="max"
+            val2=""
+          fi
+          if [[ "$type" == "v" ]]; then
+            case "$val1" in
+              2k) val1=1440 ;;
+              4k) val1=2160 ;;
+            esac
+          fi
+          echo "Quality spec: $type $val1 $val2"
+          echo "TYPE=$type" >> $GITHUB_OUTPUT
+          echo "VAL1=$val1" >> $GITHUB_OUTPUT
+          echo "VAL2=$val2" >> $GITHUB_OUTPUT
+          YT_DLP_ARGS="--cookies cookies.txt --js-runtimes deno --remote-components ejs:npm --no-progress"
+          VIDEO_JSON=$(yt-dlp $YT_DLP_ARGS -j "$LINK")
+          if [[ "$type" == "v" ]]; then
+            COMBINED=$(echo "$VIDEO_JSON" | jq '[.formats[] | select(.vcodec != "none" and .acodec != "none")]')
+            if [ "$(echo "$COMBINED" | jq 'length')" -eq 0 ]; then
+              echo "ERROR: No combined formats found."
+              exit 1
+            fi
+            case "$val1" in
+              max)
+                FORMAT_ID=$(echo "$COMBINED" | jq -r 'max_by(.height, .fps) | .format_id')
+                ;;
+              min)
+                FORMAT_ID=$(echo "$COMBINED" | jq -r 'min_by(.height, .fps) | .format_id')
+                ;;
+              *)
+                HEIGHT="$val1"
+                FPS="${val2:-0}"
+                HEIGHTS=$(echo "$COMBINED" | jq '[.[].height] | unique | sort')
+                CHOSEN_HEIGHT=$(echo "$HEIGHTS" | jq --argjson h "$HEIGHT" 'map({h:., d:(. - $h | abs)}) | sort_by(.d, .h) | first.h')
+                echo "Selected height: $CHOSEN_HEIGHT"
+                MATCHING=$(echo "$COMBINED" | jq --argjson h "$CHOSEN_HEIGHT" 'map(select(.height == $h))')
+                if [ "$FPS" -gt 0 ]; then
+                  EXACT=$(echo "$MATCHING" | jq --argjson f "$FPS" 'map(select(.fps == $f))')
+                  if [ "$(echo "$EXACT" | jq 'length')" -gt 0 ]; then
+                    FORMAT_ID=$(echo "$EXACT" | jq -r 'first.format_id')
+                  else
+                    FORMAT_ID=$(echo "$MATCHING" | jq -r 'max_by(.fps) | .format_id')
+                  fi
+                else
+                  FORMAT_ID=$(echo "$MATCHING" | jq -r 'max_by(.fps) | .format_id')
+                fi
+                ;;
+            esac
+            TOTAL_SIZE=$(echo "$VIDEO_JSON" | jq -r ".formats[] | select(.format_id == \"$FORMAT_ID\") | .filesize // .filesize_approx // 0")
+            echo "DOWNLOAD_ARGS=-f $FORMAT_ID" >> $GITHUB_OUTPUT
+            echo "TOTAL_SIZE=$TOTAL_SIZE" >> $GITHUB_OUTPUT
+          elif [[ "$type" == "a" ]]; then
+            AUDIO_FORMATS=$(echo "$VIDEO_JSON" | jq '[.formats[] | select(.vcodec == "none" and .acodec != "none")]')
+            if [ "$(echo "$AUDIO_FORMATS" | jq 'length')" -eq 0 ]; then
+              echo "ERROR: No audio-only formats found."
+              exit 1
+            fi
+            case "$val1" in
+              max)
+                FORMAT_ID=$(echo "$AUDIO_FORMATS" | jq -r 'max_by(.abr // .tbr) | .format_id')
+                ;;
+              min)
+                FORMAT_ID=$(echo "$AUDIO_FORMATS" | jq -r 'min_by(.abr // .tbr) | .format_id')
+                ;;
+              *)
+                BITRATE="$val1"
+                BITRATES=$(echo "$AUDIO_FORMATS" | jq '[.[].abr // .tbr] | unique | sort')
+                CHOSEN_BITRATE=$(echo "$BITRATES" | jq --argjson b "$BITRATE" 'map({br:., d:(. - $b | abs)}) | sort_by(.d, .br) | first.br')
+                FORMAT_ID=$(echo "$AUDIO_FORMATS" | jq -r --argjson br "$CHOSEN_BITRATE" 'map(select((.abr // .tbr) == $br)) | first.format_id')
+                ;;
+            esac
+            TOTAL_SIZE=$(echo "$VIDEO_JSON" | jq -r ".formats[] | select(.format_id == \"$FORMAT_ID\") | .filesize // .filesize_approx // 0")
+            echo "DOWNLOAD_ARGS=-f $FORMAT_ID" >> $GITHUB_OUTPUT
+            echo "TOTAL_SIZE=$TOTAL_SIZE" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download
+        run: |
+          LINK="${{ steps.detect.outputs.LINK }}"
+          IS_YOUTUBE="${{ steps.detect.outputs.IS_YOUTUBE }}"
+          download_with_progress() {
+            local yt_args="$1"
+            local output_template="$2"
+            local total_size="$3"
+            local url="$4"
+            yt-dlp $yt_args -o "$output_template" "$url" &
+            local dl_pid=$!
+            local output_dir="$(dirname "$output_template")"
+            sleep 1
+            while kill -0 $dl_pid 2>/dev/null; do
+              local part_file=$(ls "$output_dir"/*.part 2>/dev/null | head -n1)
+              if [ -n "$part_file" ]; then
+                local current=$(stat -c%s "$part_file" 2>/dev/null || echo 0)
+                if [ "$total_size" -gt 0 ]; then
+                  local percent=$(awk -v cur="$current" -v total="$total_size" 'BEGIN {printf "%.1f", (cur/total)*100}')
+                  echo "[yt-dlp] ${current} / ${total_size} bytes (${percent}%)"
+                else
+                  echo "[yt-dlp] ${current} bytes downloaded (total unknown)"
+                fi
+              else
+                echo "[yt-dlp] Waiting for download to start..."
+              fi
+              sleep 1
+            done
+            wait $dl_pid
+            local final_file=$(ls "$output_dir"/*.part 2>/dev/null | head -n1)
+            if [ -n "$final_file" ]; then
+              local final_size=$(stat -c%s "$final_file")
+              echo "[yt-dlp] Completed: ${final_size} bytes"
+            fi
+          }
+          if [ "$IS_YOUTUBE" != "true" ]; then
+            echo "Non-YouTube link. Downloading with wget..."
+            mkdir -p temp_download
+            cd temp_download
+            wget --progress=bar:force --content-disposition "$LINK"
+            cd ..
+          else
+            DOWNLOAD_ARGS="${{ steps.select_format.outputs.DOWNLOAD_ARGS }}"
+            TOTAL_SIZE="${{ steps.select_format.outputs.TOTAL_SIZE }}"
+            YT_DLP_ARGS="--cookies cookies.txt --js-runtimes deno --remote-components ejs:npm --no-progress"
+            mkdir -p temp_download
+            download_with_progress "$YT_DLP_ARGS $DOWNLOAD_ARGS" "temp_download/%(title)s.%(ext)s" "$TOTAL_SIZE" "$LINK"
+          fi
+
+      - name: Remux (YouTube video only)
+        if: steps.detect.outputs.IS_YOUTUBE == 'true' && steps.select_format.outputs.TYPE == 'v'
+        run: |
+          echo "Remuxing video for compatibility..."
+          cd temp_download
+          INPUT_FILE=$(ls -1 *.mp4 *.webm *.mkv 2>/dev/null | head -n1)
+          if [ -n "$INPUT_FILE" ]; then
+            OUTPUT_FILE="fixed_${INPUT_FILE}"
+            ffmpeg -i "$INPUT_FILE" -c copy "$OUTPUT_FILE" -y
+            if [ $? -eq 0 ]; then
+              rm "$INPUT_FILE"
+              mv "$OUTPUT_FILE" "$INPUT_FILE"
+              echo "Remux successful."
+            else
+              echo "Remux failed, keeping original file."
+            fi
+          fi
+          cd ..
+
+      - name: Split file & Create ZIP
+        run: |
+          cd temp_download
+          FILE=$(ls -1)
+          cd ..
+          mkdir -p downloads
+          zip -s 99m -r "downloads/${FILE}.zip" "temp_download/${FILE}"
+
+      - name: Upload to downloads folder
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git config http.postBuffer 524288000
+          FILES=(downloads/*)
+          total=${#FILES[@]}
+          BATCH=19
+          start=0
+          while [ $start -lt $total ]; do
+            end=$(( start + BATCH ))
+            if [ $end -gt $total ]; then end=$total; fi
+            git add "${FILES[@]:start:end-start}"
+            git commit -m "Add parts $(($start+1))-$end [skip ci]"
+            git push origin "$BRANCH"
+            start=$end
+          done
+          echo "All files uploaded to the 'downloads' folder."
